@@ -140,6 +140,44 @@ int main(void) {
   assert(memcmp(frame_tx, frame_rx, 3000U) == 0);
   printf("[nobel] Zero-RTT XOR FEC recovered dropped fragment (3000B intact, 0 retransmissions)\n");
 
+  /* 3b. Verify GF(2^8) Cauchy MDS Recovery of 4 SIMULTANEOUS lost fragments! */
+  uint8_t mds_data[8][ZPSYNC_CRUISE_MTU];
+  uint16_t mds_lens[8];
+  uint8_t mds_present[8];
+  uint8_t mds_orig[8][ZPSYNC_CRUISE_MTU];
+  for (int i = 0; i < 8; ++i) {
+    mds_lens[i] = (i == 7) ? 777U : ZPSYNC_CRUISE_MTU;
+    mds_present[i] = 1U;
+    for (uint16_t b = 0; b < mds_lens[i]; ++b) {
+      mds_data[i][b] = (uint8_t)((i * 37U + b * 13U) & 0xFFU);
+      mds_orig[i][b] = mds_data[i][b];
+    }
+  }
+  uint8_t mds_par[4][ZPSYNC_CRUISE_MTU];
+  uint8_t mds_par_pres[4] = {1, 1, 1, 1};
+  assert(zpsync_fec_encode((const uint8_t (*)[ZPSYNC_CRUISE_MTU])mds_data,
+                           mds_lens, 8, ZPSYNC_CRUISE_MTU, 4, mds_par) == 0);
+  /* Erase 4 simultaneous fragments (0, 2, 5, 7 - including the short tail!) */
+  mds_present[0] = 0;
+  mds_present[2] = 0;
+  mds_present[5] = 0;
+  mds_present[7] = 0;
+  memset(mds_data[0], 0, ZPSYNC_CRUISE_MTU);
+  memset(mds_data[2], 0, ZPSYNC_CRUISE_MTU);
+  memset(mds_data[5], 0, ZPSYNC_CRUISE_MTU);
+  memset(mds_data[7], 0, ZPSYNC_CRUISE_MTU);
+
+  int recovered = zpsync_fec_decode(mds_data, mds_lens, mds_present, 8,
+                                    ZPSYNC_CRUISE_MTU, 777U,
+                                    (const uint8_t (*)[ZPSYNC_CRUISE_MTU])mds_par,
+                                    mds_par_pres, 4);
+  assert(recovered == 4);
+  for (int i = 0; i < 8; ++i) {
+    assert(mds_present[i] == 1U);
+    assert(memcmp(mds_data[i], mds_orig[i], mds_lens[i]) == 0);
+  }
+  printf("[nobel] GF(2^8) Cauchy MDS recovered 4/8 simultaneous lost fragments (0 retransmissions)\n");
+
   /* 4. Hitless Make-Before-Break Port Hopping */
   /* First verify failed hop (peer doesn't hop) preserves old socket cleanly */
   uint16_t pre_hop_port = a.res.local_port;

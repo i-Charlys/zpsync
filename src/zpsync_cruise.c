@@ -24,6 +24,162 @@ static uint32_t read_be32(const uint8_t *p) {
          (uint32_t)p[3];
 }
 
+/* ── GF(2^8) Arithmetic (Primitive Polynomial 0x11D) ────────────────────── */
+
+static uint8_t gf_mul(uint8_t a, uint8_t b) {
+  uint8_t p = 0;
+  for (int i = 0; i < 8; ++i) {
+    if (b & 1U) p ^= a;
+    uint8_t hi = (uint8_t)(a & 0x80U);
+    a <<= 1;
+    if (hi) a ^= 0x1DU;
+    b >>= 1;
+  }
+  return p;
+}
+
+static uint8_t gf_pow(uint8_t a, uint8_t e) {
+  uint8_t r = 1;
+  while (e > 0) {
+    if (e & 1U) r = gf_mul(r, a);
+    a = gf_mul(a, a);
+    e >>= 1;
+  }
+  return r;
+}
+
+static uint8_t gf_inv(uint8_t a) { return a == 0 ? 0 : gf_pow(a, 254U); }
+
+static uint8_t cauchy_coeff(uint8_t parity_idx, uint16_t data_idx) {
+  /* x_i = 64 + i, y_j = j -> x_i ^ y_j != 0 and all pairwise distinct => MDS */
+  return gf_inv((uint8_t)((64U + data_idx) ^ parity_idx));
+}
+
+int zpsync_fec_encode(const uint8_t data[][ZPSYNC_CRUISE_MTU],
+                      const uint16_t data_lens[], uint16_t k,
+                      uint16_t max_frag_len, uint8_t parity_shards,
+                      uint8_t out_parity[][ZPSYNC_CRUISE_MTU]) {
+  if (data == NULL || data_lens == NULL || out_parity == NULL || k == 0 ||
+      k > ZPSYNC_CRUISE_MAX_FRAGS || parity_shards == 0 ||
+      parity_shards > ZPSYNC_CRUISE_MAX_PARITY ||
+      max_frag_len > ZPSYNC_CRUISE_MTU) {
+    return -1;
+  }
+
+  for (uint8_t p = 0; p < parity_shards; ++p) {
+    memset(out_parity[p], 0, max_frag_len);
+    for (uint16_t i = 0; i < k; ++i) {
+      uint8_t c = cauchy_coeff(p, i);
+      uint16_t len = data_lens[i] < max_frag_len ? data_lens[i] : max_frag_len;
+      for (uint16_t b = 0; b < len; ++b) {
+        out_parity[p][b] ^= gf_mul(c, data[i][b]);
+      }
+    }
+  }
+  return 0;
+}
+
+int zpsync_fec_decode(uint8_t data[][ZPSYNC_CRUISE_MTU], uint16_t data_lens[],
+                      uint8_t data_present[], uint16_t k, uint16_t max_frag_len,
+                      uint16_t last_frag_len,
+                      const uint8_t parity[][ZPSYNC_CRUISE_MTU],
+                      const uint8_t parity_present[], uint8_t max_parity) {
+  if (data == NULL || data_lens == NULL || data_present == NULL ||
+      parity == NULL || parity_present == NULL || k == 0 ||
+      k > ZPSYNC_CRUISE_MAX_FRAGS || max_parity > ZPSYNC_CRUISE_MAX_PARITY ||
+      max_frag_len > ZPSYNC_CRUISE_MTU) {
+    return -1;
+  }
+
+  uint16_t missing_idx[ZPSYNC_CRUISE_MAX_PARITY];
+  uint8_t m = 0;
+  for (uint16_t i = 0; i < k; ++i) {
+    if (!data_present[i]) {
+      if (m >= max_parity) return -1;
+      missing_idx[m++] = i;
+    }
+  }
+  if (m == 0) return 0;
+
+  uint8_t avail_par[ZPSYNC_CRUISE_MAX_PARITY];
+  uint8_t pcount = 0;
+  for (uint8_t p = 0; p < max_parity && pcount < m; ++p) {
+    if (parity_present[p]) avail_par[pcount++] = p;
+  }
+  if (pcount < m) return -1;
+
+  /* Build m x m Cauchy submatrix A and invert via Gauss-Jordan over GF(2^8) */
+  uint8_t mat[ZPSYNC_CRUISE_MAX_PARITY][ZPSYNC_CRUISE_MAX_PARITY];
+  uint8_t inv[ZPSYNC_CRUISE_MAX_PARITY][ZPSYNC_CRUISE_MAX_PARITY];
+  memset(inv, 0, sizeof(inv));
+  for (uint8_t r = 0; r < m; ++r) {
+    inv[r][r] = 1U;
+    for (uint8_t c = 0; c < m; ++c) {
+      mat[r][c] = cauchy_coeff(avail_par[r], missing_idx[c]);
+    }
+  }
+
+  for (uint8_t col = 0; col < m; ++col) {
+    uint8_t piv = col;
+    while (piv < m && mat[piv][col] == 0) ++piv;
+    if (piv == m) return -1;
+    if (piv != col) {
+      for (uint8_t j = 0; j < m; ++j) {
+        uint8_t t = mat[col][j];
+        mat[col][j] = mat[piv][j];
+        mat[piv][j] = t;
+        t = inv[col][j];
+        inv[col][j] = inv[piv][j];
+        inv[piv][j] = t;
+      }
+    }
+    uint8_t s = gf_inv(mat[col][col]);
+    for (uint8_t j = 0; j < m; ++j) {
+      mat[col][j] = gf_mul(mat[col][j], s);
+      inv[col][j] = gf_mul(inv[col][j], s);
+    }
+    for (uint8_t r = 0; r < m; ++r) {
+      if (r == col || mat[r][col] == 0) continue;
+      uint8_t f = mat[r][col];
+      for (uint8_t j = 0; j < m; ++j) {
+        mat[r][j] ^= gf_mul(f, mat[col][j]);
+        inv[r][j] ^= gf_mul(f, inv[col][j]);
+      }
+    }
+  }
+
+  /* Subtract known data contributions from each available parity shard */
+  uint8_t rhs[ZPSYNC_CRUISE_MAX_PARITY][ZPSYNC_CRUISE_MTU];
+  for (uint8_t r = 0; r < m; ++r) {
+    memcpy(rhs[r], parity[avail_par[r]], max_frag_len);
+    for (uint16_t i = 0; i < k; ++i) {
+      if (!data_present[i]) continue;
+      uint8_t c = cauchy_coeff(avail_par[r], i);
+      uint16_t len = data_lens[i] < max_frag_len ? data_lens[i] : max_frag_len;
+      for (uint16_t b = 0; b < len; ++b) {
+        rhs[r][b] ^= gf_mul(c, data[i][b]);
+      }
+    }
+  }
+
+  /* Reconstruct each missing fragment: data[missing_idx[r]] = sum_c inv[r][c] * rhs[c] */
+  for (uint8_t r = 0; r < m; ++r) {
+    uint16_t idx = missing_idx[r];
+    memset(data[idx], 0, max_frag_len);
+    for (uint8_t c = 0; c < m; ++c) {
+      uint8_t w = inv[r][c];
+      if (w == 0) continue;
+      for (uint16_t b = 0; b < max_frag_len; ++b) {
+        data[idx][b] ^= gf_mul(w, rhs[c][b]);
+      }
+    }
+    data_lens[idx] = (idx + 1U == k && last_frag_len > 0) ? last_frag_len : max_frag_len;
+    data_present[idx] = 1U;
+  }
+
+  return (int)m;
+}
+
 void zpsync_cruise_tx_init(zpsync_cruise_tx_s *tx) {
   if (tx != NULL) memset(tx, 0, sizeof(*tx));
 }
@@ -54,12 +210,15 @@ static int seal_and_send(zpsync_result_s *res, uint32_t frame_id,
   return sent == slen ? 0 : -1;
 }
 
-int zpsync_cruise_send_frame(zpsync_result_s *res, zpsync_cruise_tx_s *tx,
-                             const uint8_t *frame, size_t frame_len,
-                             bool is_keyframe, bool enable_xor_fec) {
+int zpsync_cruise_send_frame_fec(zpsync_result_s *res, zpsync_cruise_tx_s *tx,
+                                 const uint8_t *frame, size_t frame_len,
+                                 bool is_keyframe, uint8_t parity_shards) {
   if (res == NULL || tx == NULL || frame == NULL || frame_len == 0 ||
       res->sock == ZPSYNC_INVALID_SOCK) {
     return -1;
+  }
+  if (parity_shards > ZPSYNC_CRUISE_MAX_PARITY) {
+    parity_shards = ZPSYNC_CRUISE_MAX_PARITY;
   }
 
   size_t total = (frame_len + ZPSYNC_CRUISE_MTU - 1U) / ZPSYNC_CRUISE_MTU;
@@ -68,17 +227,18 @@ int zpsync_cruise_send_frame(zpsync_result_s *res, zpsync_cruise_tx_s *tx,
   uint32_t fid = ++tx->next_frame_id;
   uint8_t base_flags = is_keyframe ? ZPSYNC_CRUISE_FLAG_KEYFRAME : 0U;
 
-  uint8_t parity[ZPSYNC_CRUISE_MTU];
+  uint8_t data_mat[ZPSYNC_CRUISE_MAX_FRAGS][ZPSYNC_CRUISE_MTU];
+  uint16_t data_lens[ZPSYNC_CRUISE_MAX_FRAGS];
   uint16_t max_frag_len = 0;
-  if (enable_xor_fec && total >= 2U) memset(parity, 0, sizeof(parity));
 
   for (size_t i = 0; i < total; ++i) {
     size_t off = i * ZPSYNC_CRUISE_MTU;
     size_t rem = frame_len - off;
     uint16_t chunk = (uint16_t)(rem > ZPSYNC_CRUISE_MTU ? ZPSYNC_CRUISE_MTU : rem);
+    data_lens[i] = chunk;
     if (chunk > max_frag_len) max_frag_len = chunk;
-    if (enable_xor_fec && total >= 2U) {
-      for (uint16_t b = 0; b < chunk; ++b) parity[b] ^= frame[off + b];
+    if (parity_shards > 0 && total >= 2U) {
+      memcpy(data_mat[i], frame + off, chunk);
     }
     if (seal_and_send(res, fid, (uint16_t)i, (uint16_t)total, chunk, base_flags,
                       frame + off) != 0) {
@@ -88,16 +248,30 @@ int zpsync_cruise_send_frame(zpsync_result_s *res, zpsync_cruise_tx_s *tx,
     tx->bytes_sent += chunk;
   }
 
-  if (enable_xor_fec && total >= 2U) {
-    if (seal_and_send(res, fid, (uint16_t)total, (uint16_t)total, max_frag_len,
-                      (uint8_t)(base_flags | ZPSYNC_CRUISE_FLAG_PARITY),
-                      parity) == 0) {
-      ++tx->fec_sent;
+  if (parity_shards > 0 && total >= 2U) {
+    uint8_t par[ZPSYNC_CRUISE_MAX_PARITY][ZPSYNC_CRUISE_MTU];
+    if (zpsync_fec_encode(data_mat, data_lens, (uint16_t)total, max_frag_len,
+                          parity_shards, par) == 0) {
+      for (uint8_t p = 0; p < parity_shards; ++p) {
+        if (seal_and_send(res, fid, (uint16_t)(total + p), (uint16_t)total,
+                          max_frag_len,
+                          (uint8_t)(base_flags | ZPSYNC_CRUISE_FLAG_PARITY),
+                          par[p]) == 0) {
+          ++tx->fec_sent;
+        }
+      }
     }
   }
 
   ++tx->frames_sent;
   return 0;
+}
+
+int zpsync_cruise_send_frame(zpsync_result_s *res, zpsync_cruise_tx_s *tx,
+                             const uint8_t *frame, size_t frame_len,
+                             bool is_keyframe, bool enable_xor_fec) {
+  return zpsync_cruise_send_frame_fec(res, tx, frame, frame_len, is_keyframe,
+                                      enable_xor_fec ? 1U : 0U);
 }
 
 static void reset_rx_frame(zpsync_cruise_rx_s *rx, uint32_t fid, uint16_t total,
@@ -107,8 +281,9 @@ static void reset_rx_frame(zpsync_cruise_rx_s *rx, uint32_t fid, uint16_t total,
   rx->received_count = 0;
   rx->last_frag_len = 0;
   rx->flags = (uint8_t)(flags & ZPSYNC_CRUISE_FLAG_KEYFRAME);
-  rx->has_parity = 0;
-  rx->parity_len = 0;
+  rx->parity_count = 0;
+  memset(rx->parity_present, 0, sizeof(rx->parity_present));
+  memset(rx->parity_lens, 0, sizeof(rx->parity_lens));
   memset(rx->frag_present, 0, total);
 }
 
@@ -116,31 +291,23 @@ static int try_assemble_frame(zpsync_cruise_rx_s *rx, uint8_t *out_frame,
                               size_t max_frame_len, bool *out_is_keyframe) {
   if (rx->total_frags == 0) return 0;
 
-  /* Recover 1 missing fragment via XOR parity if available */
-  if (rx->received_count + 1U == rx->total_frags && rx->has_parity) {
-    uint16_t missing = ZPSYNC_CRUISE_MAX_FRAGS;
-    for (uint16_t i = 0; i < rx->total_frags; ++i) {
-      if (!rx->frag_present[i]) {
-        missing = i;
-        break;
-      }
-    }
-    if (missing < rx->total_frags) {
-      memset(rx->frags[missing], 0, rx->parity_len);
-      memcpy(rx->frags[missing], rx->parity, rx->parity_len);
-      for (uint16_t i = 0; i < rx->total_frags; ++i) {
-        if (i == missing) continue;
-        for (uint16_t b = 0; b < rx->frag_lens[i]; ++b) {
-          rx->frags[missing][b] ^= rx->frags[i][b];
+  if (rx->received_count < rx->total_frags && rx->parity_count > 0) {
+    uint16_t missing = (uint16_t)(rx->total_frags - rx->received_count);
+    if (missing <= rx->parity_count) {
+      uint16_t max_plen = 0;
+      for (uint8_t p = 0; p < ZPSYNC_CRUISE_MAX_PARITY; ++p) {
+        if (rx->parity_present[p] && rx->parity_lens[p] > max_plen) {
+          max_plen = rx->parity_lens[p];
         }
       }
-      rx->frag_lens[missing] =
-          (missing + 1U == rx->total_frags && rx->last_frag_len > 0)
-              ? rx->last_frag_len
-              : rx->parity_len;
-      rx->frag_present[missing] = 1;
-      ++rx->received_count;
-      ++rx->fec_recoveries;
+      int rec = zpsync_fec_decode(rx->frags, rx->frag_lens, rx->frag_present,
+                                  rx->total_frags, max_plen, rx->last_frag_len,
+                                  rx->parity, rx->parity_present,
+                                  ZPSYNC_CRUISE_MAX_PARITY);
+      if (rec > 0) {
+        rx->received_count = (uint16_t)(rx->received_count + (uint16_t)rec);
+        rx->fec_recoveries += (uint64_t)rec;
+      }
     }
   }
 
@@ -207,9 +374,13 @@ int zpsync_cruise_recv_frame(zpsync_result_s *res, zpsync_cruise_rx_s *rx,
       }
 
       if ((flags & ZPSYNC_CRUISE_FLAG_PARITY) != 0) {
-        memcpy(rx->parity, plain + ZPSYNC_CRUISE_HDR_BYTES, plen);
-        rx->parity_len = plen;
-        rx->has_parity = 1;
+        uint16_t p_idx = (fidx >= total) ? (uint16_t)(fidx - total) : 0U;
+        if (p_idx < ZPSYNC_CRUISE_MAX_PARITY && !rx->parity_present[p_idx]) {
+          memcpy(rx->parity[p_idx], plain + ZPSYNC_CRUISE_HDR_BYTES, plen);
+          rx->parity_lens[p_idx] = plen;
+          rx->parity_present[p_idx] = 1;
+          ++rx->parity_count;
+        }
       } else if (fidx < total && !rx->frag_present[fidx]) {
         memcpy(rx->frags[fidx], plain + ZPSYNC_CRUISE_HDR_BYTES, plen);
         rx->frag_lens[fidx] = plen;
