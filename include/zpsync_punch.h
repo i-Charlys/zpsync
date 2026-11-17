@@ -33,11 +33,12 @@ extern "C" {
 
 /**
  * Sealed handshake datagram:
- *   12B nonce + 24B plaintext + 16B tag = 52 bytes
- * Plaintext (24B):
- *   magic(4) + msg_type(1) + flags(1) + hop_epoch(2) + session_id(8) + peer_nonce(8)
+ *   12B nonce + 56B plaintext + 16B tag = 84 bytes
+ * Plaintext (56B):
+ *   magic(4) + msg_type(1) + flags(1) + hop_epoch(2) + session_id(8) +
+ *   peer_nonce(8) + ephemeral_pub(32)
  */
-#define ZPSYNC_HS_PLAIN_BYTES 24U
+#define ZPSYNC_HS_PLAIN_BYTES 56U
 #define ZPSYNC_HS_WIRE_BYTES                                                           \
   (ZPSYNC_NONCE_BYTES + ZPSYNC_HS_PLAIN_BYTES + ZPSYNC_TAG_BYTES)
 
@@ -56,6 +57,7 @@ typedef struct {
   uint16_t hop_epoch;
   uint64_t session_id;
   uint64_t peer_nonce;
+  uint8_t ephemeral_pub[ZPSYNC_X25519_BYTES]; /**< X25519 ephemeral public key for PFS */
 } zpsync_hs_msg_s;
 
 typedef struct {
@@ -68,6 +70,8 @@ typedef struct {
   uint64_t remote_nonce;
   uint32_t rtt_ms;
   uint8_t local_is_initiator;
+  uint8_t pfs_enabled;
+  uint8_t pfs_key[ZPSYNC_KEY_BYTES]; /**< Forward-secure key if X25519 succeeded */
 } zpsync_punch_out_s;
 
 /**
@@ -106,19 +110,35 @@ int zpsync_punch_ipv4_sentinel(const uint8_t key[ZPSYNC_KEY_BYTES],
                                bool use_icmp_sentinel, zpsync_punch_out_s *out);
 
 /**
- * @brief Brique 4: Birthday-Paradox statistical NAT punch for symmetric CGNAT.
+ * @brief Brique 4: Hybrid Stride + Birthday-Paradox statistical NAT punch for
+ *        symmetric CGNAT.
  *        Opens @p socket_count (256..500) UDP sockets on ports derived from
  *        zpsync_derive_birthday_port(S, i), sprays @p peer_ipv4 across derived
- *        ports + incremental (+1/+2) predictions around @p peer_base_port for
- *        @p timeout_ms, locks the first socket that receives an authenticated
- *        ACK/SYN-ACK, and immediately closes all other sockets.
+ *        ports + multi-stride arithmetic progression around @p peer_base_port
+ *        (using @p peer_port_stride when known) for @p timeout_ms, locks the
+ *        first socket that receives an authenticated ACK/SYN-ACK, and closes
+ *        all other sockets.
  */
 int zpsync_punch_ipv4_birthday(const uint8_t *secret, size_t secret_len,
                                const uint8_t key[ZPSYNC_KEY_BYTES],
                                const uint8_t peer_ipv4[4],
-                               uint16_t peer_base_port, uint32_t socket_count,
+                               uint16_t peer_base_port,
+                               int32_t peer_port_stride, uint32_t socket_count,
                                uint64_t local_nonce, uint32_t timeout_ms,
                                zpsync_punch_out_s *out);
+
+/**
+ * @brief Staggered Happy-Eyeballs parallel race between IPv6 Direct (t=0ms)
+ *        and IPv4 Sentinel+UDP (t=80ms). Cancels the slower path immediately
+ *        when the first authenticated handshake completes.
+ */
+int zpsync_punch_race_v6_v4(const uint8_t key[ZPSYNC_KEY_BYTES],
+                            const uint8_t *peer_ipv6, uint16_t v6_local_port,
+                            uint16_t v6_peer_port, const uint8_t *peer_ipv4,
+                            uint16_t v4_local_port, uint16_t v4_peer_port,
+                            uint64_t local_nonce, uint32_t flow_entropy,
+                            bool use_icmp_sentinel, uint32_t timeout_ms,
+                            zpsync_punch_out_s *out);
 
 #ifdef __cplusplus
 }

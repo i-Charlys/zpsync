@@ -22,6 +22,7 @@ extern "C" {
 #define ZPSYNC_SHA1_BYTES 20U
 #define ZPSYNC_SHA256_BYTES 32U
 #define ZPSYNC_KEY_BYTES RUDP_CRYPTO_KEY_BYTES
+#define ZPSYNC_X25519_BYTES 32U
 #define ZPSYNC_NONCE_BYTES RUDP_CRYPTO_NONCE_BYTES
 #define ZPSYNC_TAG_BYTES RUDP_CRYPTO_TAG_BYTES
 
@@ -134,6 +135,37 @@ int zpsync_mailbox_open(const uint8_t key[ZPSYNC_KEY_BYTES], const uint8_t *seal
  * @brief Fills @p buf with @p len cryptographically strong random bytes.
  */
 int zpsync_random_bytes(uint8_t *buf, size_t len);
+
+/**
+ * @brief Constant-time RFC 7748 X25519 scalar multiplication: out = scalar * u_point.
+ */
+void zpsync_x25519(uint8_t out[ZPSYNC_X25519_BYTES],
+                   const uint8_t scalar[ZPSYNC_X25519_BYTES],
+                   const uint8_t u_point[ZPSYNC_X25519_BYTES]);
+
+/**
+ * @brief Generates an ephemeral X25519 keypair (priv, pub).
+ */
+int zpsync_x25519_keygen(uint8_t out_priv[ZPSYNC_X25519_BYTES],
+                         uint8_t out_pub[ZPSYNC_X25519_BYTES]);
+
+/**
+ * @brief Computes X25519 shared secret and checks for all-zero low-order points.
+ * @return 0 on valid shared secret, -1 on low-order / invalid point.
+ */
+int zpsync_x25519_shared(const uint8_t priv[ZPSYNC_X25519_BYTES],
+                         const uint8_t peer_pub[ZPSYNC_X25519_BYTES],
+                         uint8_t out_shared[ZPSYNC_X25519_BYTES]);
+
+/**
+ * @brief Combines the pre-shared key @p base_key with an ephemeral X25519
+ *        shared secret @p ecdh_shared and @p session_id to derive a
+ *        Forward-Secure (PFS) 256-bit cruise key.
+ */
+int zpsync_derive_pfs_key(const uint8_t base_key[ZPSYNC_KEY_BYTES],
+                          const uint8_t ecdh_shared[ZPSYNC_X25519_BYTES],
+                          uint64_t session_id,
+                          uint8_t out_pfs_key[ZPSYNC_KEY_BYTES]);
 
 #ifdef __cplusplus
 }

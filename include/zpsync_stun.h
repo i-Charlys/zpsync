@@ -41,6 +41,7 @@ typedef struct {
   uint8_t local_ipv6[16];
   uint8_t has_ipv6;
   zpsync_nat_type_e nat_type;
+  int32_t port_stride; /**< Measured symmetric NAT port delta (alt_port - pri_port) */
   uint32_t rtt_ms;
 } zpsync_net_probe_s;
 

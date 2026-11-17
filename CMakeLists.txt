@@ -37,6 +37,7 @@ set(ZPSYNC_SOURCES
   src/zpsync_dht.c
   src/zpsync_sentinel.c
   src/zpsync_punch.c
+  src/zpsync_cruise.c
   src/zpsync.c
 )
 
@@ -84,6 +85,7 @@ if(ZPSYNC_BUILD_TESTS)
     test_stun_codec
     test_sentinel_icmp
     test_punch_loopback
+    test_nobel_breakthroughs
   )
 
   foreach(test_name IN LISTS ZPSYNC_TESTS)

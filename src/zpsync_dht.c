@@ -292,6 +292,48 @@ int zpsync_dht_encode_bep44_get(const uint8_t tx_id[2],
   return w.err == 0 ? (int)w.len : -1;
 }
 
+int zpsync_dht_encode_bep44_put_imm(const uint8_t tx_id[2],
+                                    const uint8_t self_id[ZPSYNC_DHT_NODE_ID_BYTES],
+                                    const uint8_t *token, size_t token_len,
+                                    const uint8_t *value, size_t value_len,
+                                    uint8_t *out_buf, size_t max_len) {
+  if (token == NULL || token_len == 0 || value == NULL || value_len == 0) {
+    return -1;
+  }
+  zpsync_benc_writer_s w;
+  zpsync_benc_writer_init(&w, out_buf, max_len);
+  zpsync_benc_begin_dict(&w);
+  zpsync_benc_write_str(&w, "a");
+  zpsync_benc_begin_dict(&w);
+  zpsync_benc_write_str(&w, "id");
+  zpsync_benc_write_bytes(&w, self_id, ZPSYNC_DHT_NODE_ID_BYTES);
+  zpsync_benc_write_str(&w, "token");
+  zpsync_benc_write_bytes(&w, token, token_len);
+  zpsync_benc_write_str(&w, "v");
+  zpsync_benc_write_bytes(&w, value, value_len);
+  zpsync_benc_end(&w);
+  zpsync_benc_write_str(&w, "q");
+  zpsync_benc_write_str(&w, "put");
+  zpsync_benc_write_str(&w, "t");
+  zpsync_benc_write_bytes(&w, tx_id, 2);
+  zpsync_benc_write_str(&w, "y");
+  zpsync_benc_write_str(&w, "q");
+  zpsync_benc_end(&w);
+  return w.err == 0 ? (int)w.len : -1;
+}
+
+int zpsync_dht_xor_cmp(const uint8_t target[ZPSYNC_DHT_NODE_ID_BYTES],
+                       const uint8_t a[ZPSYNC_DHT_NODE_ID_BYTES],
+                       const uint8_t b[ZPSYNC_DHT_NODE_ID_BYTES]) {
+  for (size_t i = 0; i < ZPSYNC_DHT_NODE_ID_BYTES; ++i) {
+    uint8_t da = (uint8_t)(target[i] ^ a[i]);
+    uint8_t db = (uint8_t)(target[i] ^ b[i]);
+    if (da < db) return -1;
+    if (da > db) return 1;
+  }
+  return 0;
+}
+
 /* ── KRPC Reply Decoder ─────────────────────────────────────────────────── */
 
 static bool key_eq(const uint8_t *k, size_t klen, const char *lit) {
@@ -416,6 +458,28 @@ static const char *const DHT_BOOTSTRAPS[] = {
     "dht.aelitis.com",
 };
 
+static void insert_sorted_node(zpsync_dht_node_s *frontier, size_t *count,
+                               size_t cap, const uint8_t target[20],
+                               const zpsync_dht_node_s *cand, size_t min_pos) {
+  for (size_t i = 0; i < *count; ++i) {
+    if (memcmp(frontier[i].ip, cand->ip, 4) == 0 && frontier[i].port == cand->port) {
+      return;
+    }
+  }
+  size_t pos = *count;
+  while (pos > min_pos &&
+         zpsync_dht_xor_cmp(target, cand->id, frontier[pos - 1].id) < 0) {
+    --pos;
+  }
+  if (pos >= cap) return;
+  size_t end = (*count < cap) ? (*count) : (cap - 1U);
+  for (size_t i = end; i > pos; --i) {
+    frontier[i] = frontier[i - 1U];
+  }
+  frontier[pos] = *cand;
+  if (*count < cap) ++(*count);
+}
+
 static void add_unique_peer(zpsync_dht_peer_s *peers, size_t *count, size_t max_peers,
                             const zpsync_dht_peer_s *cand) {
   if (*count >= max_peers || cand->port == 0) return;
@@ -513,8 +577,9 @@ int zpsync_dht_rendezvous(const uint8_t *secret, size_t secret_len,
           for (size_t p = 0; p < rep.peer_count; ++p) {
             add_unique_peer(out_peers, &peer_count, max_peers, &rep.peers[p]);
           }
-          for (size_t k = 0; k < rep.node_count && frontier_count < 64U; ++k) {
-            frontier[frontier_count++] = rep.nodes[k];
+          for (size_t k = 0; k < rep.node_count; ++k) {
+            insert_sorted_node(frontier, &frontier_count, 64U, info_hashes[1],
+                               &rep.nodes[k], next_node_idx);
           }
           if (rep.token_len > 0 && local_announce_port > 0) {
             uint8_t apkt[256];

@@ -431,3 +431,179 @@ int zpsync_random_bytes(uint8_t *buf, size_t len) {
   return 0;
 #endif
 }
+
+/* ── Constant-Time RFC 7748 X25519 (Curve25519) ─────────────────────────── */
+
+typedef int64_t fe25519[16];
+
+static void fe_copy(fe25519 o, const fe25519 a) {
+  for (int i = 0; i < 16; ++i) o[i] = a[i];
+}
+
+static void fe_cswap(fe25519 p, fe25519 q, int bit) {
+  int64_t c = ~(int64_t)(bit - 1);
+  for (int i = 0; i < 16; ++i) {
+    int64_t t = c & (p[i] ^ q[i]);
+    p[i] ^= t;
+    q[i] ^= t;
+  }
+}
+
+static void fe_carry(fe25519 o) {
+  for (int i = 0; i < 16; ++i) {
+    o[i] += (1LL << 16);
+    int64_t c = o[i] >> 16;
+    o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
+    o[i] -= c << 16;
+  }
+}
+
+static void fe_add(fe25519 o, const fe25519 a, const fe25519 b) {
+  for (int i = 0; i < 16; ++i) o[i] = a[i] + b[i];
+}
+
+static void fe_sub(fe25519 o, const fe25519 a, const fe25519 b) {
+  for (int i = 0; i < 16; ++i) o[i] = a[i] - b[i];
+}
+
+static void fe_mul(fe25519 o, const fe25519 a, const fe25519 b) {
+  int64_t t[31];
+  for (int i = 0; i < 31; ++i) t[i] = 0;
+  for (int i = 0; i < 16; ++i) {
+    for (int j = 0; j < 16; ++j) t[i + j] += a[i] * b[j];
+  }
+  for (int i = 0; i < 15; ++i) t[i] += 38 * t[i + 16];
+  for (int i = 0; i < 16; ++i) o[i] = t[i];
+  fe_carry(o);
+  fe_carry(o);
+}
+
+static void fe_sq(fe25519 o, const fe25519 a) { fe_mul(o, a, a); }
+
+static void fe_inv(fe25519 o, const fe25519 i) {
+  fe25519 c;
+  fe_copy(c, i);
+  for (int a = 253; a >= 0; --a) {
+    fe_sq(c, c);
+    if (a != 2 && a != 4) fe_mul(c, c, i);
+  }
+  fe_copy(o, c);
+}
+
+static void fe_unpack(fe25519 o, const uint8_t n[32]) {
+  for (int i = 0; i < 16; ++i) {
+    o[i] = (int64_t)n[2 * i] + ((int64_t)n[2 * i + 1] << 8);
+  }
+  o[15] &= 0x7FFF;
+}
+
+static void fe_pack(uint8_t o[32], const fe25519 n) {
+  fe25519 t, m;
+  fe_copy(t, n);
+  fe_carry(t);
+  fe_carry(t);
+  fe_carry(t);
+  for (int j = 0; j < 2; ++j) {
+    m[0] = t[0] - 0xFFED;
+    for (int i = 1; i < 15; ++i) {
+      m[i] = t[i] - 0xFFFF - ((m[i - 1] >> 16) & 1);
+      m[i - 1] &= 0xFFFF;
+    }
+    m[15] = t[15] - 0x7FFF - ((m[14] >> 16) & 1);
+    int b = (int)((m[15] >> 16) & 1);
+    m[14] &= 0xFFFF;
+    fe_cswap(t, m, 1 - b);
+  }
+  for (int i = 0; i < 16; ++i) {
+    o[2 * i] = (uint8_t)(t[i] & 0xFF);
+    o[2 * i + 1] = (uint8_t)(t[i] >> 8);
+  }
+}
+
+void zpsync_x25519(uint8_t out[ZPSYNC_X25519_BYTES],
+                   const uint8_t scalar[ZPSYNC_X25519_BYTES],
+                   const uint8_t u_point[ZPSYNC_X25519_BYTES]) {
+  uint8_t z[32];
+  memcpy(z, scalar, 32);
+  z[0] &= 248;
+  z[31] &= 127;
+  z[31] |= 64;
+
+  fe25519 x, a, b, c, d, e, f;
+  static const fe25519 k121665 = {0xDB41, 1, 0, 0, 0, 0, 0, 0,
+                                  0,      0, 0, 0, 0, 0, 0, 0};
+  fe_unpack(x, u_point);
+  for (int i = 0; i < 16; ++i) {
+    a[i] = (i == 0) ? 1 : 0;
+    b[i] = x[i];
+    c[i] = 0;
+    d[i] = (i == 0) ? 1 : 0;
+  }
+
+  for (int i = 254; i >= 0; --i) {
+    int r = (z[i >> 3] >> (i & 7)) & 1;
+    fe_cswap(a, b, r);
+    fe_cswap(c, d, r);
+    fe_add(e, a, c);
+    fe_sub(a, a, c);
+    fe_add(c, b, d);
+    fe_sub(b, b, d);
+    fe_sq(d, e);
+    fe_sq(f, a);
+    fe_mul(a, c, a);
+    fe_mul(c, b, e);
+    fe_add(e, a, c);
+    fe_sub(a, a, c);
+    fe_sq(b, a);
+    fe_sub(c, d, f);
+    fe_mul(a, c, k121665);
+    fe_add(a, a, d);
+    fe_mul(c, c, a);
+    fe_mul(a, d, f);
+    fe_mul(d, b, x);
+    fe_sq(b, e);
+    fe_cswap(a, b, r);
+    fe_cswap(c, d, r);
+  }
+  fe_inv(c, c);
+  fe_mul(a, a, c);
+  fe_pack(out, a);
+}
+
+int zpsync_x25519_keygen(uint8_t out_priv[ZPSYNC_X25519_BYTES],
+                         uint8_t out_pub[ZPSYNC_X25519_BYTES]) {
+  if (out_priv == NULL || out_pub == NULL) return -1;
+  if (zpsync_random_bytes(out_priv, ZPSYNC_X25519_BYTES) != 0) return -1;
+  static const uint8_t basepoint[32] = {9};
+  zpsync_x25519(out_pub, out_priv, basepoint);
+  return 0;
+}
+
+int zpsync_x25519_shared(const uint8_t priv[ZPSYNC_X25519_BYTES],
+                         const uint8_t peer_pub[ZPSYNC_X25519_BYTES],
+                         uint8_t out_shared[ZPSYNC_X25519_BYTES]) {
+  if (priv == NULL || peer_pub == NULL || out_shared == NULL) return -1;
+  zpsync_x25519(out_shared, priv, peer_pub);
+  uint8_t acc = 0;
+  for (size_t i = 0; i < ZPSYNC_X25519_BYTES; ++i) acc |= out_shared[i];
+  return acc == 0 ? -1 : 0;
+}
+
+int zpsync_derive_pfs_key(const uint8_t base_key[ZPSYNC_KEY_BYTES],
+                          const uint8_t ecdh_shared[ZPSYNC_X25519_BYTES],
+                          uint64_t session_id,
+                          uint8_t out_pfs_key[ZPSYNC_KEY_BYTES]) {
+  if (base_key == NULL || ecdh_shared == NULL || out_pfs_key == NULL) return -1;
+  static const uint8_t domain[] = "zpsync-v2-pfs-key";
+  uint8_t sid_be[8];
+  store_be64(sid_be, session_id);
+  sha256_ctx_s ctx;
+  sha256_init(&ctx);
+  sha256_update(&ctx, domain, sizeof(domain) - 1U);
+  sha256_update(&ctx, base_key, ZPSYNC_KEY_BYTES);
+  sha256_update(&ctx, ecdh_shared, ZPSYNC_X25519_BYTES);
+  sha256_update(&ctx, sid_be, sizeof(sid_be));
+  sha256_final(&ctx, out_pfs_key);
+  return 0;
+}
+

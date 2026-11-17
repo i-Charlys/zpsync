@@ -84,6 +84,24 @@ static void test_krpc_encode_decode(void) {
   assert(rep.peer_count == 1);
   assert(rep.peers[0].ip[0] == 198 && rep.peers[0].port == 50000U);
   assert(rep.token_len == 5 && memcmp(rep.token, "mytok", 5) == 0);
+
+  /* Kademlia XOR distance comparison */
+  uint8_t target[20] = {0};
+  uint8_t closer[20] = {0};
+  uint8_t farther[20] = {0};
+  closer[19] = 0x01U;
+  farther[0] = 0x80U;
+  assert(zpsync_dht_xor_cmp(target, closer, farther) < 0);
+  assert(zpsync_dht_xor_cmp(target, farther, closer) > 0);
+  assert(zpsync_dht_xor_cmp(target, closer, closer) == 0);
+
+  /* BEP 44 immutable put */
+  uint8_t put_pkt[256];
+  uint8_t payload[68] = {0x42};
+  int put_len = zpsync_dht_encode_bep44_put_imm(
+      tx, self_id, (const uint8_t *)"tok1", 4, payload, sizeof(payload),
+      put_pkt, sizeof(put_pkt));
+  assert(put_len > 80);
 }
 
 int main(void) {

@@ -243,6 +243,7 @@ int zpsync_probe_network(uint16_t local_port_hint, uint32_t timeout_ms,
     memset(&alt, 0, sizeof(alt));
     if (stun_query_on_sock(sock, ZPSYNC_STUN_ALT_HOST, ZPSYNC_STUN_ALT_PORT,
                            timeout_ms, &alt, NULL) == 0) {
+      out_probe->port_stride = (int32_t)alt.port - (int32_t)out_probe->public_v4.port;
       if (alt.port != out_probe->public_v4.port) {
         out_probe->nat_type = ZPSYNC_NAT_SYMMETRIC;
       } else if (alt.port == bound_port) {

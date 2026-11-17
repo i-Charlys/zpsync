@@ -73,6 +73,7 @@ typedef struct {
   uint64_t hop_epoch;          /**< Current deterministic port-hop epoch */
   uint32_t rtt_ms;             /**< Measured handshake RTT */
   uint8_t local_is_initiator;  /**< 1 if initiator, 0 if responder */
+  uint8_t pfs_enabled;         /**< 1 if X25519 Forward Secrecy is active */
 } zpsync_result_s;
 
 /**
@@ -92,6 +93,23 @@ int zpsync_connect(const zpsync_config_s *cfg, zpsync_result_s *out_res);
  */
 int zpsync_hop_port(zpsync_result_s *res, const uint8_t *secret, size_t secret_len,
                     uint64_t new_epoch);
+
+/**
+ * @brief Hitless Make-Before-Break port migration during cruise:
+ *        Opens the new socket on `Port_Hop(S, new_epoch)` while keeping
+ *        `res->sock` active, verifies the new path with an authenticated probe
+ *        for up to @p verify_timeout_ms, and switches atomically only on ACK.
+ *        Zero video frames are dropped if the new port is blocked.
+ */
+int zpsync_hop_make_before_break(zpsync_result_s *res, const uint8_t *secret,
+                                 size_t secret_len, uint64_t new_epoch,
+                                 uint32_t verify_timeout_ms);
+
+int zpsync_hop_make_before_break_ex(zpsync_result_s *res, const uint8_t *secret,
+                                    size_t secret_len, uint64_t new_epoch,
+                                    uint16_t local_port_override,
+                                    uint16_t peer_port_override,
+                                    uint32_t verify_timeout_ms);
 
 /**
  * @brief Closes the cruise socket and zeroizes the AEAD crypto context.

@@ -136,6 +136,23 @@ int zpsync_dht_encode_bep44_get(const uint8_t tx_id[2],
                                 uint8_t *out_buf, size_t max_len);
 
 /**
+ * @brief Encodes a BEP 44 `put` query for an immutable item (e.g. sealed mailbox).
+ */
+int zpsync_dht_encode_bep44_put_imm(const uint8_t tx_id[2],
+                                    const uint8_t self_id[ZPSYNC_DHT_NODE_ID_BYTES],
+                                    const uint8_t *token, size_t token_len,
+                                    const uint8_t *value, size_t value_len,
+                                    uint8_t *out_buf, size_t max_len);
+
+/**
+ * @brief Compares Kademlia 160-bit XOR distance: returns <0 if `a` is closer to
+ *        @p target than `b`, >0 if farther, 0 if equal.
+ */
+int zpsync_dht_xor_cmp(const uint8_t target[ZPSYNC_DHT_NODE_ID_BYTES],
+                       const uint8_t a[ZPSYNC_DHT_NODE_ID_BYTES],
+                       const uint8_t b[ZPSYNC_DHT_NODE_ID_BYTES]);
+
+/**
  * @brief Parses a KRPC response packet into @p out_reply.
  */
 int zpsync_dht_decode_reply(const uint8_t *pkt, size_t pkt_len,

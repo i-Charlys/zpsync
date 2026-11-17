@@ -20,6 +20,7 @@ static int finalize_cruise_handoff(const uint8_t key[ZPSYNC_KEY_BYTES],
   out_res->hop_epoch = hop_epoch;
   out_res->rtt_ms = pout->rtt_ms;
   out_res->local_is_initiator = pout->local_is_initiator;
+  out_res->pfs_enabled = pout->pfs_enabled;
 
   if (rudp_session_init(&out_res->session) != RUDP_OK) {
     zpsync_sock_close(out_res->sock);
@@ -34,7 +35,8 @@ static int finalize_cruise_handoff(const uint8_t key[ZPSYNC_KEY_BYTES],
   rudp_session_set_qos(&out_res->session, 0, 0, 46U);
   rudp_session_set_qos(&out_res->session, 1, 1, 34U);
 
-  if (rudp_crypto_init(&out_res->crypto, key, pout->session_id,
+  const uint8_t *cruise_key = pout->pfs_enabled ? pout->pfs_key : key;
+  if (rudp_crypto_init(&out_res->crypto, cruise_key, pout->session_id,
                        pout->local_is_initiator) != RUDP_OK) {
     zpsync_sock_close(out_res->sock);
     out_res->sock = ZPSYNC_INVALID_SOCK;
@@ -108,8 +110,8 @@ int zpsync_connect(const zpsync_config_s *cfg, zpsync_result_s *out_res) {
         }
       }
       if (zpsync_punch_ipv4_birthday(cfg->secret, cfg->secret_len, key, peer_addr,
-                                     peer_port, cfg->birthday_sockets, local_nonce,
-                                     punch_ms, &pout) == 0) {
+                                     peer_port, 1, cfg->birthday_sockets,
+                                     local_nonce, punch_ms, &pout) == 0) {
         return finalize_cruise_handoff(key, ZPSYNC_PATH_IPV4_BIRTHDAY,
                                        ZPSYNC_NAT_SYMMETRIC, time_win, &pout,
                                        out_res);
@@ -153,7 +155,7 @@ int zpsync_connect(const zpsync_config_s *cfg, zpsync_result_s *out_res) {
     }
 
     if (zpsync_punch_ipv4_birthday(cfg->secret, cfg->secret_len, key,
-                                   dht_peers[i].ip, peer_port,
+                                   dht_peers[i].ip, peer_port, probe.port_stride,
                                    cfg->birthday_sockets, local_nonce, punch_ms,
                                    &pout) == 0) {
       return finalize_cruise_handoff(key, ZPSYNC_PATH_IPV4_BIRTHDAY,
@@ -189,6 +191,102 @@ int zpsync_hop_port(zpsync_result_s *res, const uint8_t *secret, size_t secret_l
   res->peer_port = hop_port;
   res->hop_epoch = new_epoch;
   return 0;
+}
+
+int zpsync_hop_make_before_break_ex(zpsync_result_s *res, const uint8_t *secret,
+                                    size_t secret_len, uint64_t new_epoch,
+                                    uint16_t local_port_override,
+                                    uint16_t peer_port_override,
+                                    uint32_t verify_timeout_ms) {
+  if (res == NULL || secret == NULL || secret_len == 0 ||
+      res->sock == ZPSYNC_INVALID_SOCK) {
+    return -1;
+  }
+  uint8_t key[ZPSYNC_KEY_BYTES];
+  if (zpsync_derive_session_key(secret, secret_len, key) != 0) return -1;
+
+  uint16_t derived = zpsync_derive_target_port(secret, secret_len, new_epoch);
+  if (derived == 0) return -1;
+  uint16_t lport = local_port_override > 0 ? local_port_override : derived;
+  uint16_t pport = peer_port_override > 0 ? peer_port_override : derived;
+
+  uint16_t bound = 0;
+  zpsync_sock_t new_sock = zpsync_udp_open(res->family, lport, true, true, &bound);
+  if (new_sock == ZPSYNC_INVALID_SOCK) return -1;
+
+  uint8_t nonce[ZPSYNC_NONCE_BYTES];
+  uint8_t eph_pub[ZPSYNC_X25519_BYTES] = {0};
+  if (zpsync_random_bytes(nonce, sizeof(nonce)) != 0) {
+    zpsync_sock_close(new_sock);
+    return -1;
+  }
+  uint8_t my_role_flag = res->local_is_initiator ? 1U : 2U;
+  zpsync_hs_msg_s probe = {.msg_type = ZPSYNC_HS_TYPE_SYN,
+                           .flags = my_role_flag,
+                           .hop_epoch = (uint16_t)(new_epoch & 0xFFFFU),
+                           .session_id = res->session_id,
+                           .peer_nonce = res->session_id};
+  memcpy(probe.ephemeral_pub, eph_pub, sizeof(eph_pub));
+  uint8_t wire[ZPSYNC_HS_WIRE_BYTES];
+  if (zpsync_hs_seal(key, nonce, &probe, wire, sizeof(wire)) < 0) {
+    zpsync_sock_close(new_sock);
+    return -1;
+  }
+
+  uint64_t deadline =
+      zpsync_now_ms() + (verify_timeout_ms > 0 ? verify_timeout_ms : 250U);
+  bool verified = false;
+  uint64_t next_tx = 0;
+  while (zpsync_now_ms() < deadline) {
+    uint64_t now = zpsync_now_ms();
+    if (now >= next_tx) {
+      zpsync_udp_sendto(new_sock, res->family, res->peer_addr, pport, wire,
+                        sizeof(wire));
+      next_tx = now + 25U;
+    }
+    uint8_t ready = 0;
+    if (zpsync_poll_readable(&new_sock, 1, 15U, &ready) > 0 && (ready & 1U)) {
+      uint8_t rx[256];
+      uint8_t rfam = 0, raddr[16];
+      uint16_t rport = 0;
+      int n = zpsync_udp_recvfrom(new_sock, &rfam, raddr, &rport, rx, sizeof(rx));
+      zpsync_hs_msg_s rep;
+      if (n == (int)ZPSYNC_HS_WIRE_BYTES &&
+          zpsync_hs_open(key, rx, (size_t)n, &rep) == 0 &&
+          rep.session_id == res->session_id && rep.flags != my_role_flag) {
+        if (rep.msg_type == ZPSYNC_HS_TYPE_SYN) {
+          probe.msg_type = ZPSYNC_HS_TYPE_ACK;
+          if (zpsync_hs_seal(key, nonce, &probe, wire, sizeof(wire)) > 0) {
+            zpsync_udp_sendto(new_sock, res->family, res->peer_addr, pport,
+                              wire, sizeof(wire));
+          }
+        }
+        verified = true;
+        break;
+      }
+    }
+  }
+
+  if (!verified ||
+      zpsync_sock_connect_peer(new_sock, res->family, res->peer_addr, pport) != 0) {
+    /* Old socket remains untouched — zero dropped frames */
+    zpsync_sock_close(new_sock);
+    return -1;
+  }
+
+  zpsync_sock_close(res->sock);
+  res->sock = new_sock;
+  res->local_port = bound;
+  res->peer_port = pport;
+  res->hop_epoch = new_epoch;
+  return 0;
+}
+
+int zpsync_hop_make_before_break(zpsync_result_s *res, const uint8_t *secret,
+                                 size_t secret_len, uint64_t new_epoch,
+                                 uint32_t verify_timeout_ms) {
+  return zpsync_hop_make_before_break_ex(res, secret, secret_len, new_epoch, 0, 0,
+                                         verify_timeout_ms);
 }
 
 void zpsync_close(zpsync_result_s *res) {
