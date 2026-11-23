@@ -28,6 +28,8 @@ if(DEFINED ENV{ZCRUDP_DIR} AND NOT "$ENV{ZCRUDP_DIR}" STREQUAL "")
 endif()
 list(APPEND _zpsync_zcrudp_candidates
   "${CMAKE_CURRENT_SOURCE_DIR}/../zcrudp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../zcrudp-main"
+  "${CMAKE_CURRENT_SOURCE_DIR}/../zcrudp-src"
   "${CMAKE_CURRENT_SOURCE_DIR}/deps/zcrudp"
   "${CMAKE_CURRENT_BINARY_DIR}/_deps/zcrudp-src"
 )
