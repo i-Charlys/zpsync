@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "zpsync.h"
 
 #include <assert.h>
@@ -16,6 +19,7 @@ typedef HANDLE thread_t;
   } while (0)
 #else
 #include <pthread.h>
+#include <time.h>
 typedef pthread_t thread_t;
 #define THREAD_RET void *
 #define THREAD_CREATE(t, fn, arg) pthread_create(&(t), NULL, (fn), (arg))
@@ -88,6 +92,8 @@ static void test_manual_rudp_handoff_and_hop(void) {
     if (n < 0) {
 #if defined(_WIN32)
       Sleep(5);
+#else
+      { struct timespec ts = {0, 5000000L}; nanosleep(&ts, NULL); }
 #endif
     }
   }

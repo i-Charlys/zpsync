@@ -1,3 +1,6 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "zpsync.h"
 #include "zpsync_cruise.h"
 
@@ -17,6 +20,7 @@ typedef HANDLE thread_t;
   } while (0)
 #else
 #include <pthread.h>
+#include <time.h>
 typedef pthread_t thread_t;
 #define THREAD_RET void *
 #define THREAD_CREATE(t, fn, arg) pthread_create(&(t), NULL, (fn), (arg))
@@ -128,6 +132,8 @@ int main(void) {
     if (recv(b.res.sock, (char *)dropped, sizeof(dropped), 0) > 0) break;
 #if defined(_WIN32)
     Sleep(2);
+#else
+    { struct timespec ts = {0, 2000000L}; nanosleep(&ts, NULL); }
 #endif
   }
   /* Remaining 2 data fragments + 1 XOR parity must reconstruct all 3000 bytes */
