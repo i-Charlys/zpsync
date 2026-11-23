@@ -31,6 +31,8 @@ Direct serverless NAT traversal and RUDP handoff for ultra-low-latency video str
 
 ## Build & Test
 
+`zpsync` builds standalone — if `../zcrudp` is not present locally, CMake automatically downloads `zcrudp` into `build/_deps/zcrudp-src` (disable with `-DZPSYNC_AUTO_FETCH=OFF` or pass `-DZCRUDP_DIR=<path>`):
+
 ```powershell
 cmake -S . -B build
 cmake --build build
